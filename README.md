@@ -163,3 +163,124 @@ never two independent phone recordings.
 ## Security / compatibility note
 
 This prototype enables transitional/non-compliant Sendspin compatibility and automatically approves the selected clients for unpaired playback. That is convenient for a LAN lab test, not appropriate as a finished security model. Never commit `.opensurround/` state (it contains your private server identity and pairing store).
+
+## Live Shairport Sync PCM FIFO input
+
+The live input accepts an **existing POSIX named pipe** containing interleaved
+signed S32LE PCM. Defaults are 48000 Hz and six channels in FL, FR, FC, LFE,
+SL, SR order. It shifts each signed sample right by 16 bits into S16LE, without
+resampling, dithering, channel remapping, or decoding AAC. Shairport Sync remains
+responsible for decoding and producing the agreed format.
+
+On the Linux host already running Shairport Sync 5.6 with its output configured
+to `/tmp/surround.pcm`, use these commands from the project directory:
+
+```bash
+source .venv/bin/activate
+# Create once, before either process opens it; preserve an existing FIFO.
+if [ ! -e /tmp/surround.pcm ]; then mkfifo -m 600 /tmp/surround.pcm; fi
+test -p /tmp/surround.pcm
+opensurround --input-pipe /tmp/surround.pcm \
+  --sample-rate 48000 --channels 6 --format s32le \
+  -c configs/surround-live.toml
+```
+
+The pipe must be readable by OpenSurround and writable by the Shairport service
+account; arrange ownership/access for those actual accounts. In another terminal,
+if Shairport Sync is managed by the existing `shairport-sync` systemd service:
+
+```bash
+sudo systemctl start shairport-sync
+```
+
+Either process can start first. A blocking FIFO writer started first waits until
+OpenSurround opens the FIFO. These commands use the existing Shairport setup and
+do not change its installation or configuration. Select that Shairport receiver
+on the Apple TV. Point the front ESP32 Sendspin receiver to this host, port 8928.
+The supplied configuration includes only `ESP32 AirPlay Nappali` on channels 0/1;
+no other receiver is required. Additional routes can be enabled explicitly:
+
+```toml
+[endpoints.center-sub]
+match_name = "ESP32 Center"
+source_channels = [2, 3]
+gain_db = 0.0
+delay_ms = 0.0
+
+[endpoints.rear]
+match_name = "ESP32 Rear"
+source_channels = [4, 5]
+gain_db = 0.0
+delay_ms = 0.0
+```
+
+### Live timeline and recovery policy
+
+- The reader starts before Sendspin discovery completes. It drains even with no
+  receivers. Nonblocking descriptor readiness callbacks do bounded work, with no
+  blocking reader threads. At 20 ms, each input chunk is 960 frames / 23040 bytes,
+  converted to 11520 output bytes. Only three completed chunks plus less than one
+  partial input chunk are retained, in addition to the bounded kernel FIFO.
+- Each available, uniquely matched endpoint gets its configured channels. An
+  offline endpoint does not hold up other endpoints. Multiple matching clients,
+  or one client matching multiple endpoints, are withheld instead of assigning
+  another route. Names must remain stable and unique.
+- Start uses fresh audio after grouping and approval. There is no WAV-style
+  preroll burst or per-chunk pacing sleep. The first shared presentation timestamp
+  is the Sendspin clock plus `buffer_lead_ms` (300 ms here), raised when an active
+  role reports a larger minimum buffer/output delay. Subsequent timestamps advance
+  by exact frame counts; all endpoint payloads commit together. Sendspin may
+  repacketize 20 ms input into 25 ms output. Gain and delay apply per route;
+  configured delay buffers are reset with each stream.
+- PCM zero samples are ordinary audio. A short input gap keeps the timeline if
+  no data was lost. No replacement silence is generated. Missing input for three
+  chunks (at least 50 ms; 60 ms with this config), observed EOF, dropped chunks,
+  or timeline drift beyond that threshold causes a restart. Partial chunks are
+  discarded on interruption; a stalled writer's remaining incomplete frame bytes
+  are skipped to retain frame alignment.
+- Writer reconnect uses the same open FIFO descriptor. EOF readiness is disabled
+  and retried every 100 ms to avoid CPU spin. Recovery drops old queued audio.
+  The next stream calls the existing group stop/start lifecycle and anchors a
+  fresh future timeline; it never continues the pre-interruption timestamp cursor.
+- Receiver transport changes immediately stop the old group transport and clear
+  its replay caches. Available endpoints regroup with stable per-endpoint channel
+  IDs. Reconnect or membership changes restart all currently available outputs
+  together, with a brief audible gap, to preserve one shared timeline. Unknown
+  players resolve to an unused channel rather than another endpoint's route.
+- SIGINT and SIGTERM cancel playback, stop the group, close the descriptor,
+  unregister callbacks/timers and close the server. There are no blocked worker
+  threads to leave behind.
+
+### FIFO limitations and verification
+
+Raw PCM has no format headers, capture timestamps, writer identity or framing
+markers. All writers must honor the same format and start on a complete frame;
+use exactly one writer and one reader. If writers hand over without an observable
+EOF or time gap, the reader cannot detect the boundary. Replacing/unlinking the
+FIFO inode while it is open is unsupported: restart OpenSurround against the new
+pipe. A writer which holds the FIFO open while idle is handled by the interruption
+timeout. Audio already buffered inside Shairport/kernel transport cannot be dated
+reliably; recovery guarantees apply to observed bytes, not original capture time.
+A receiver slower than real time or a non-real-time producer may cause drops and
+restarts. This favors current audio over lossless delivery during overload.
+
+This mode requires POSIX `add_reader` support (Linux target; also exercised on
+macOS). It does not resample source clock drift; prolonged drift can trigger a
+fresh stream. It cannot guarantee uninterrupted sound during source/network
+outages. S32LE is the only raw input format currently supported. Outgoing codec
+selection remains with `aiosendspin` and receiver capability negotiation; software
+loopback covers PCM rather than physical ESP32 FLAC playback.
+
+```bash
+pytest -v
+python tests/loopback_e2e_6ch.py
+python tests/loopback_live_fifo.py
+```
+
+The live loopback uses real filesystem FIFOs and three real Sendspin WebSocket
+clients, with bounded timeouts. It checks both startup orders, active input with
+receivers absent, receiver reconnect, writer reconnect after a prolonged outage,
+channel values and shared timestamps. WAV remains available with
+`opensurround test_6ch.wav -c configs/6ch-demo.toml`, retaining its preroll, pacing
+and EOF drain behavior. Software tests do **not** verify acoustic speaker
+synchronization, actual Shairport/Apple TV decoding, or Apple TV lip-sync.

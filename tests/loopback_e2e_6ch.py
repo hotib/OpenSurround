@@ -121,8 +121,7 @@ async def main() -> None:
     diffs = [b - a for a, b in zip(ts, ts[1:])]
     print(f"shared timeline OK: {len(ts)} identical timestamps across 3 clients, deltas {min(diffs)}..{max(diffs)} us")
     for c in clients.values():
-        if hasattr(c, "close"):
-            await c.close()
+        await c.disconnect()
     print("LOOPBACK E2E 6CH (5.1): PASSED")
 
 
