@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenSurround FIFO router and web settings
+Wants=network-online.target
+After=network-online.target opensurround-airplay.service
+
+[Service]
+Type=exec
+User=opensurround
+Group=opensurround
+WorkingDirectory=/var/lib/opensurround
+EnvironmentFile=/etc/opensurround/opensurround.env
+ExecStart=/opt/opensurround/venv/bin/python -m opensurround.cli --input-pipe ${FIFO} --sample-rate 48000 --channels ${CHANNELS} --format s32le --config ${PROFILE} --state-dir /var/lib/opensurround/sendspin --web --web-host ${WEB_HOST} --web-port ${WEB_PORT} --web-token-file /etc/opensurround/web.token $AIRPLAY_ARGS
+UMask=0077
+PrivateTmp=no
+NoNewPrivileges=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

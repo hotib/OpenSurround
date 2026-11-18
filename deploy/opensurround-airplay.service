@@ -1,0 +1,20 @@
+[Unit]
+Description=OpenSurround AirPlay sender agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=opensurround
+Group=opensurround
+WorkingDirectory=/var/lib/opensurround
+RuntimeDirectory=opensurround-airplay
+RuntimeDirectoryMode=0700
+ExecStart=/opt/opensurround/venv/bin/python -m opensurround.airplay_agent --socket /run/opensurround-airplay/agent.sock --binary /opt/opensurround/cliairplay --state-dir /var/lib/opensurround/airplay $AIRPLAY_PTP
+UMask=0077
+KillMode=mixed
+NoNewPrivileges=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

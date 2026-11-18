@@ -312,3 +312,126 @@ channel values and shared timestamps. WAV remains available with
 `opensurround test_6ch.wav -c configs/6ch-demo.toml`, retaining its preroll, pacing
 and EOF drain behavior. Software tests do **not** verify acoustic speaker
 synchronization, actual Shairport/Apple TV decoding, or Apple TV lip-sync.
+
+## Deploy on an existing Debian 13 Proxmox LXC
+
+Run the installer as root **inside the existing LXC** from this repository.
+Keep the working custom Shairport Sync and NQPTP setup and its existing PCM
+FIFO. The installer leaves those services, their configuration and the FIFO
+inode alone. The deployed router reads 48 kHz S32LE and starts one web UI on
+port 8080, listening on all IPv4 interfaces by default. Use
+`--web-host <LXC-LAN-IP>` to bind only to the LAN address.
+
+### Stage and cut over
+
+1. Back up the old OpenSurround launch command or service unit, TOML and Sendspin
+   state. Stop the old router before copying a consistent profile and pairing
+   store. If it runs as a systemd service, use
+   `systemctl disable --now <old-unit>`. For a manual launch, stop it with
+   Ctrl-C or SIGTERM and disable any supervisor or scheduled command that could
+   relaunch it. If the old unit uses either packaged unit name, save and remove
+   its registration, including any associated drop-ins, then run
+   `systemctl daemon-reload` before installation. Keep Shairport and NQPTP running.
+2. Ensure the existing Shairport user can still write to the FIFO and the
+   `opensurround` service user can traverse its parent directories and read it.
+   For a private FIFO, an ACL granting that user read permission is one option.
+   The installer creates the account if needed and reports if the FIFO is
+   inaccessible. Preserve its permissions across any recreation by the producer.
+3. Stage the install, using your actual paths. Omit `--sendspin-state` if you
+   have no prior state. Omit `--config` for an empty route list on Sendspin port
+   8928. Use `--fifo` if the FIFO differs from `/tmp/surround.pcm`.
+
+   ```bash
+   sudo bash deploy/install.sh --no-start \
+     --config /path/to/old/live.toml \
+     --sendspin-state /path/to/old/.opensurround \
+     --fifo /tmp/surround.pcm --channels 6
+   ```
+
+4. Ensure the old router is still stopped and the web and Sendspin ports are
+   free. Start the sender first if AirPlay is enabled, then start the router.
+
+   ```bash
+   sudo systemctl enable --now opensurround-airplay.service
+   sudo systemctl enable --now opensurround.service
+   sudo systemctl status opensurround.service opensurround-airplay.service
+   sudo journalctl -u opensurround.service -u opensurround-airplay.service -b
+   ```
+
+   For a Sendspin-only install, pass `--no-airplay` and skip starting the
+   AirPlay agent. When staging a change from an enabled agent to Sendspin-only,
+   also run `sudo systemctl disable --now opensurround-airplay.service` before
+   starting the router. Omitting `--no-start` lets the installer handle the
+   packaged services. It restarts those services on a reinstall.
+
+Open `http://<LXC-LAN-IP>:8080` (or your chosen web port) on the trusted LAN.
+Read the admin token privately with `sudo cat /etc/opensurround/web.token` and
+enter it in the UI. The installer never displays it. Keep existing Sendspin
+clients on the same LXC address and imported TOML port. The installed profile is
+`/var/lib/opensurround/profile/live.toml`. Its web revisions live beside it.
+The Sendspin import copies `identity.key` and, when present, `pairings.json` to
+`/var/lib/opensurround/sendspin`. The imported TOML still controls
+`persist_pairings`.
+
+For 7.1, configure the PCM producer for fixed interleaved 48 kHz S32LE with
+the eight-channel order FL, FR, FC, LFE, BL, BR, SL, SR. Select the input width
+with `--channels 8` and pass a 7.1 TOML with `--config` on its first install.
+The installer keeps 7.1 routes in `live-71.toml` beside the 5.1 profile,
+so switching back to `--channels 6` uses the existing 5.1 assignments. Each
+layout and its channel labels appear in the web settings.
+
+### Optional sender and native PTP
+
+The default AirPlay agent starts in non-PTP mode. Receiver compatibility
+depends on the receiver's supported streaming and timing modes. The installer
+checks the Linux amd64/arm64 binary against the pinned SHA-256 for
+[v0.5.15](https://github.com/music-assistant/airplay-cli/releases/tag/v0.5.15).
+Use `--airplay-binary FILE` to seed a trusted, compatible local binary in place
+of the download. An existing `/opt/opensurround/cliairplay` is reused on
+reinstall. The same noninteractive `opensurround` account runs both units and
+owns the private agent socket at `/run/opensurround-airplay/agent.sock` and the
+persistent sender state at `/var/lib/opensurround/airplay`.
+
+If a receiver needs native PTP, first provision a dedicated secondary LAN veth
+for the sender through Proxmox, using the same LAN bridge and an unused IPv4
+address on that LAN. This is a one-time addition for native PTP. Pass
+`sudo bash deploy/add-proxmox-airplay-interface.sh <CTID>` on the Proxmox
+node to prepare the dedicated veth. Inside the LXC, pass
+`--airplay-address <address/prefix>` and, if the in-container veth is named
+differently, `--airplay-interface <name>` (default `ap2eth`). The complete
+deployment checkout must include `deploy/airplay-net.sh` and
+`deploy/opensurround-airplay-net.service`. The installer copies them and writes
+`/etc/opensurround/airplay-net.env`. The network unit prepares
+`/run/opensurround-airplay-net/netns` before the sender starts. Only the sender
+joins that namespace and binds UDP 319/320 there. The router, FIFO and
+Shairport/NQPTP stay in the primary container environment. Use `--airplay` to
+return to non-PTP mode, or `--no-airplay` to turn off AirPlay output.
+
+### Reinstall and roll back
+
+Before an upgrade, back up `/etc/opensurround`, `/var/lib/opensurround` and
+the installed units and drop-ins in a private location. Stop the packaged units
+when taking a consistent state backup. Reinstall from the desired checkout,
+omitting the one-time `--config` and `--sendspin-state` imports. Existing
+settings, profile, revisions, tokens and identities are reused. The installer
+builds a new regular Python venv under `/opt/opensurround/releases` before
+switching `/opt/opensurround/venv`. With `--no-start` it stages files and reloads
+unit definitions. Any running services and their boot enablement are left as is.
+
+To return to the prior **packaged** release, stop the router and agent, then
+restore any changed unit files or settings from your backup. If PTP was running,
+stop `opensurround-airplay-net.service` after the agent and before restoring its
+settings. Switch the venv to the previous release, reload systemd and start only
+the services that were enabled for the prior deployment.
+
+```bash
+sudo systemctl stop opensurround.service opensurround-airplay.service
+sudo ln -sfnT "$(readlink -e /opt/opensurround/venv.previous)" /opt/opensurround/venv
+sudo systemctl daemon-reload
+```
+
+Start the agent first if the prior release used AirPlay, then run
+`sudo systemctl start opensurround.service`. If the
+older version was the **pre-install** router, disable and stop the packaged
+router and sender, stop the PTP network unit if used, and restore the old unit
+or command with its original TOML and state. Leave only one FIFO reader running.

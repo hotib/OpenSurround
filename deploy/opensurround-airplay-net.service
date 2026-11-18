@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenSurround AirPlay sender network namespace
+After=network.target
+Before=opensurround-airplay.service
+
+[Service]
+Type=notify
+NotifyAccess=all
+EnvironmentFile=/etc/opensurround/airplay-net.env
+RuntimeDirectory=opensurround-airplay-net
+ExecStart=/opt/opensurround/airplay-net.sh
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_ADMIN
+NoNewPrivileges=yes
+KillMode=mixed
+TimeoutStartSec=15s
+TimeoutStopSec=15s
