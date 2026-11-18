@@ -20,7 +20,11 @@ from .web_store import NoPreviousRevision, RevisionConflict, RouteStore
 
 _LOG = logging.getLogger("opensurround.web")
 _ASSETS = Path(__file__).with_name("web_static")
-_CHANNELS_51 = ("FL", "FR", "FC", "LFE", "SL", "SR")
+_INPUT_LAYOUTS = {
+    2: ("2.0", ("FL", "FR")),
+    6: ("5.1", ("FL", "FR", "FC", "LFE", "SL", "SR")),
+    8: ("7.1", ("FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR")),
+}
 _SECURITY_HEADERS = {
     "Cache-Control": "no-store",
     "Content-Security-Policy": "default-src 'none'; script-src 'self'; style-src 'self'; "
@@ -82,10 +86,11 @@ class WebControl:
         return replace(config, endpoints=endpoints) if endpoints != config.endpoints else config
 
     @asynccontextmanager
-    async def serve(self, server, channels: int, *, airplay=None):
+    async def serve(self, server, channels: int, *, airplay=None, sample_rate: int | None = None):
         store = RouteStore(self.config_path, channels)
         self.saved = await asyncio.to_thread(store.read)
-        app = self.make_app(store, lambda: sendspin_devices(server), airplay=airplay)
+        app = self.make_app(store, lambda: sendspin_devices(server), airplay=airplay,
+                            sample_rate=sample_rate)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         try:
@@ -95,7 +100,8 @@ class WebControl:
         finally:
             await runner.cleanup()
 
-    def make_app(self, store: RouteStore, devices, *, airplay=None) -> web.Application:
+    def make_app(self, store: RouteStore, devices, *, airplay=None,
+                 sample_rate: int | None = None) -> web.Application:
         lock = asyncio.Lock()
         pairing = asyncio.Lock()
 
@@ -124,7 +130,9 @@ class WebControl:
             return response
 
         def state(snapshot):
-            channels = _CHANNELS_51 if store.channels == 6 else tuple(str(i + 1) for i in range(store.channels))
+            layout, channels = _INPUT_LAYOUTS.get(store.channels, (None, ()))
+            if not channels:
+                channels = tuple(str(i + 1) for i in range(store.channels))
             inventory = devices()
             discovered = airplay.devices if airplay is not None else {}
             known = {ep.client_id for ep in snapshot.config.endpoints if ep.transport == "airplay"}
@@ -141,6 +149,8 @@ class WebControl:
                 "can_restore": snapshot.can_restore,
                 "pending": self.active_endpoints != snapshot.config.endpoints,
                 "channels": channels,
+                "input_layout": layout,
+                "sample_rate": sample_rate,
                 "devices": inventory,
                 "endpoints": [
                     {"key": ep.name, "label": ep.label if ep.label is not None else ep.name,

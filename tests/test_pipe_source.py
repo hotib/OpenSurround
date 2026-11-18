@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 
 from opensurround.pipe_source import PipePCMSource
+from opensurround.routing import split_int16_interleaved
 from fifo_helpers import pcm_block, open_writer, write_bytes
 
 
@@ -77,6 +78,29 @@ def test_all_signed_conversion_edges(tmp_path):
         finally:
             source.close()
             os.close(fd)
+    asyncio.run(scenario())
+
+
+def test_eight_channel_input_keeps_side_and_back_distinct(tmp_path):
+    async def scenario():
+        path = tmp_path / "pcm71"
+        os.mkfifo(path)
+        source = PipePCMSource(path, channels=8)
+        source.start()
+        fd = await open_writer(path)
+        try:
+            values = np.arange(1, 9, dtype="<i4") << 16
+            await write_bytes(fd, values.tobytes() * source.frames_per_chunk)
+            chunk = await asyncio.wait_for(source.read(), 1)
+            routes = {"front": (0, 1), "center_lfe": (2, 3), "back": (4, 5), "side": (6, 7)}
+            outputs = split_int16_interleaved(chunk.pcm, 8, routes)
+            for name, channels in routes.items():
+                pcm = np.frombuffer(outputs[name], dtype="<i2").reshape(-1, 2)
+                assert np.all(pcm == [index + 1 for index in channels])
+        finally:
+            os.close(fd)
+            source.close()
+
     asyncio.run(scenario())
 
 

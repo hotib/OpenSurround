@@ -45,6 +45,9 @@ function showFailure(error) {
 function accept(state, reset = false) {
   const reload = reset || (!dirty && (!snapshot || state.revision !== snapshot.revision));
   snapshot = state;
+  const profile = state.input_layout ?? `${state.channels.length} csatorna`;
+  const rate = state.sample_rate ? ` · ${(state.sample_rate / 1000).toLocaleString("hu-HU")} kHz` : "";
+  byId("input-profile").textContent = `PCM bemenet · ${profile}${rate}`;
   if (reload) {
     draftRevision = state.revision;
     draft = structuredClone(state.endpoints);
@@ -321,7 +324,7 @@ byId("discard").addEventListener("click", () => {
   }
 });
 byId("restore").addEventListener("click", () => {
-  if (window.confirm("Visszaállítod az előző mentés útvonalait?")) {
+  if (!dirty || window.confirm("Elveted a mentetlen módosításokat és visszaállítod az előző mentést?")) {
     act(() => request("/api/restore", "POST", {revision: snapshot.revision}), "Az előző mentés visszaállítva.");
   }
 });

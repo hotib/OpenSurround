@@ -65,6 +65,29 @@ def test_existing_profile_edit_and_restore(tmp_path):
     asyncio.run(exercise())
 
 
+def test_eight_channel_web_input_layout(tmp_path):
+    profile = tmp_path / "profile.toml"
+    profile.write_bytes(Path("configs/surround-live.toml").read_bytes())
+
+    async def exercise():
+        store = RouteStore(profile, 8)
+        control = WebControl(str(profile), "127.0.0.1", 8080, None)
+        control.saved = store.read()
+        app = control.make_app(store, lambda: [], sample_rate=48000)
+        async with TestClient(TestServer(app)) as client:
+            headers = {"X-OpenSurround": "1"}
+            response = await client.get("/api/state", headers=headers)
+            state = await response.json()
+            assert state["channels"] == ["FL", "FR", "FC", "LFE", "BL", "BR", "SL", "SR"]
+            assert state["input_layout"] == "7.1" and state["sample_rate"] == 48000
+            state["endpoints"][0]["source_channels"] = [6, 7]
+            response = await client.put("/api/routes", headers=headers, json=state)
+            assert response.status == 200
+            assert store.read().config.endpoints[0].source_channels == (6, 7)
+
+    asyncio.run(exercise())
+
+
 def test_airplay_routes_and_pairing(tmp_path):
     import json
     from types import SimpleNamespace

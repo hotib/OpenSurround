@@ -182,7 +182,9 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
                 _LOG.warning("AirPlay discovery or agent unavailable")
                 airplay = None
         if web is not None:
-            await services.enter_async_context(web.serve(server, source.info.channels, airplay=airplay))
+            await services.enter_async_context(web.serve(
+                server, source.info.channels, airplay=airplay, sample_rate=source.info.sample_rate,
+            ))
         if input_pipe:
             await _run_live(server, config, source, web=web, airplay=airplay)
             return
