@@ -14,6 +14,20 @@ For browser access from another computer on a trusted LAN, set
 by the service user and have mode `600`. Use HTTPS or an SSH tunnel
 when the network cannot be trusted.
 
+## Optional AirPlay output for live FIFO input
+
+Pass `--airplay-socket /run/opensurround/airplay.sock` with `--input-pipe`
+to connect the router to a separately running AirPlay egress agent over a
+local Unix socket. The router discovers AirPlay receivers over mDNS on the
+same LAN and skips addresses belonging to its own interfaces.
+
+With `--web`, select a discovered AirPlay receiver, choose its source channels
+and mode (`auto`, `native`, or `compat`), and save the route. Use the receiver's
+pairing button if a PIN is required. A TOML route uses `transport = "airplay"`,
+`client_id` from the inventory, and optionally `airplay_mode` (default `auto`).
+Existing routes default to Sendspin. Both transports use the same FIFO sample
+timeline, and an offline AirPlay output has its own status in the inventory.
+
 A deliberately small proof of concept for **different multichannel PCM pairs sent to different Sendspin clients on one synchronized timeline**.
 
 ## What this proves (once run against two real clients)

@@ -14,7 +14,7 @@ from uuid import uuid4
 
 import tomlkit
 
-from .config import Config, parse_config
+from .config import AIRPLAY_MODES, Config, parse_config
 
 _REVISION_MARKER = b"# OpenSurround web revision "
 
@@ -118,6 +118,10 @@ class RouteStore:
                 for field, value in fields.items():
                     if field in ("match_name", "client_id") and not value:
                         table.pop(field, None)
+                    elif field == "airplay_mode" and fields["transport"] != "airplay":
+                        table.pop(field, None)
+                    elif field == "transport" and field not in table and value == "sendspin":
+                        continue
                     elif field in table and table[field] == value:
                         continue
                     elif field == "label" and field not in table and value == key:
@@ -177,10 +181,15 @@ class RouteStore:
         label = row.get("label")
         match_name = row.get("match_name", "")
         client_id = row.get("client_id", "")
+        old = original.get(key)
+        transport = row.get("transport", old.transport if old else "sendspin")
+        mode = row.get("airplay_mode", old.airplay_mode if old else "auto")
+        if transport not in ("sendspin", "airplay") or mode not in AIRPLAY_MODES:
+            raise ValueError("Érvénytelen kimenet vagy AirPlay-mód.")
         if (not isinstance(label, str) or not label.strip() or
                 not isinstance(match_name, str) or not isinstance(client_id, str) or
-                not (client_id.strip() or match_name.strip())):
-            raise ValueError("Adj meg nevet és válassz egy Sendspin-eszközt.")
+                not (client_id.strip() or (transport == "sendspin" and match_name.strip()))):
+            raise ValueError("Adj meg nevet és válassz egy eszközt.")
         sources = row.get("source_channels")
         if (not isinstance(sources, list) or len(sources) not in (1, 2) or
                 any(type(ch) is not int or not 0 <= ch < self.channels for ch in sources)):
@@ -188,12 +197,12 @@ class RouteStore:
         gain = row.get("gain_db")
         delay = row.get("delay_ms")
         muted = row.get("muted")
-        old = original.get(key)
         if (type(gain) not in (int, float) or
                 not (-120 <= gain <= 120 or old and gain == old.gain_db and math.isfinite(gain)) or
                 type(delay) not in (int, float) or
                 not (0 <= delay <= 10_000 or old and delay == old.delay_ms and math.isfinite(delay)) or
                 type(muted) is not bool):
             raise ValueError("Az erősítés −120 és +120 dB, a késleltetés 0 és 10 000 ms között lehet.")
-        return key, dict(label=label, match_name=match_name, client_id=client_id,
+        return key, dict(label=label, match_name=match_name if transport == "sendspin" else "",
+                         client_id=client_id, transport=transport, airplay_mode=mode,
                          source_channels=sources, gain_db=gain, delay_ms=delay, muted=muted)

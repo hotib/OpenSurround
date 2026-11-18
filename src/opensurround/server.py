@@ -1,8 +1,10 @@
 from __future__ import annotations
 import asyncio
 from contextlib import AsyncExitStack
+from dataclasses import replace
 import logging
 from pathlib import Path
+from time import time_ns
 from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
@@ -18,6 +20,7 @@ from .wav_source import WavSource
 from .pipe_source import PipePCMSource
 
 if TYPE_CHECKING:
+    from .airplay import AirPlayDevice, AirPlayOutputs
     from .web import WebControl
 
 _LOG = logging.getLogger("opensurround")
@@ -94,15 +97,46 @@ def _make_feeder(ep: EndpointConfig, sample_rate: int, frames_per_chunk: int, ch
     return feeder
 
 
+_AIRPLAY_ERRORS = (ValueError, OSError, RuntimeError)
+
+
+class LiveAirPlay:
+    def __init__(self, outputs: AirPlayOutputs, devices: dict[str, AirPlayDevice]):
+        self.outputs = outputs
+        self.devices = devices
+        self.errors = set()
+
+    def call(self, method, device_id, *args, **kwargs):
+        try:
+            method(*args, **kwargs)
+        except _AIRPLAY_ERRORS:
+            self.errors.add(device_id)
+        else:
+            self.errors.discard(device_id)
+
+    def status(self, device_id):
+        if device_id not in self.devices:
+            return "offline"
+        if device_id in self.errors:
+            return "error"
+        try:
+            return self.outputs.status(device_id)
+        except _AIRPLAY_ERRORS:
+            return "error"
+
+
 async def run(config: Config, wav_path: str | None = None, state_dir: str = ".opensurround", *,
               input_pipe: str | None = None, sample_rate: int = 48000,
-              channels: int = 6, sample_format: str = "s32le", web: WebControl | None = None) -> None:
+              channels: int = 6, sample_format: str = "s32le", web: WebControl | None = None,
+              airplay_socket: str | None = None) -> None:
     if bool(wav_path) == bool(input_pipe):
         raise ValueError("provide exactly one WAV or FIFO input")
+    if airplay_socket is not None and not input_pipe:
+        raise ValueError("AirPlay requires FIFO input")
     source = (PipePCMSource(input_pipe, config.chunk_ms, sample_rate=sample_rate,
                             channels=channels, sample_format=sample_format)
               if input_pipe else WavSource(wav_path, config.chunk_ms))
-    web_stack = AsyncExitStack()
+    services = AsyncExitStack()
     try:
         _validate_audio(config, source.info.channels)
     except Exception:
@@ -135,16 +169,31 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
         _LOG.info("Sendspin server listening on %s:%s", config.host, config.port)
         _LOG.info("Point Kiosk Satellite Sendspin 'Server' to <this-host>:%s if discovery picks Music Assistant instead.", config.port)
 
+        airplay = None
+        if airplay_socket is not None:
+            try:
+                from .airplay import AirPlayOutputs
+                from .airplay_discovery import discover_airplay
+
+                airplay = LiveAirPlay(AirPlayOutputs(airplay_socket), {})
+                services.push_async_callback(airplay.outputs.close)
+                await services.enter_async_context(discover_airplay(airplay.devices))
+            except (ImportError, OSError, RuntimeError, ValueError):
+                _LOG.warning("AirPlay discovery or agent unavailable")
+                airplay = None
         if web is not None:
-            await web_stack.enter_async_context(web.serve(server, source.info.channels))
+            await services.enter_async_context(web.serve(server, source.info.channels, airplay=airplay))
         if input_pipe:
-            await _run_live(server, config, source, web=web)
+            await _run_live(server, config, source, web=web, airplay=airplay)
             return
+        config = _sendspin_config(config)
         if web is None:
+            if not config.endpoints:
+                raise ValueError("WAV input requires a Sendspin route")
             clients = await _wait_for_named_clients(server, config)
         else:
             while True:
-                config = web.at_boundary(config)
+                config = _sendspin_config(web.at_boundary(config))
                 clients = _match_live_clients(server, config, report=False)
                 if clients and len(clients) == len(config.endpoints):
                     break
@@ -243,7 +292,7 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
     finally:
         source.close()
         try:
-            await web_stack.aclose()
+            await services.aclose()
         finally:
             await server.close()
 
@@ -260,10 +309,16 @@ def _validate_audio(config: Config, channels: int) -> None:
             raise ValueError(f"endpoint {ep.name}: gain/delay must be finite and delay nonnegative")
 
 
+def _sendspin_config(config: Config) -> Config:
+    return replace(config, endpoints=tuple(ep for ep in config.endpoints if ep.transport == "sendspin"))
+
+
 def _match_live_clients(server: SendspinServer, config: Config, *, report: bool = True) -> dict:
     """Ambiguous endpoints and clients matching multiple routes are quarantined."""
     found = {}
     for ep in config.endpoints:
+        if ep.transport != "sendspin":
+            continue
         matches = [c for c in server.connected_clients if _matches_endpoint(ep, c)]
         if len(matches) == 1:
             found[ep.name] = matches[0]
@@ -277,7 +332,7 @@ def _match_live_clients(server: SendspinServer, config: Config, *, report: bool 
 
 
 async def _run_live(server: SendspinServer, config: Config, source: PipePCMSource,
-                    *, web: WebControl | None = None) -> None:
+                    *, web: WebControl | None = None, airplay: LiveAirPlay | None = None) -> None:
     loop = asyncio.get_running_loop()
     group = stream = None
     active = {}
@@ -294,6 +349,43 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
     transport_changed = False
     quarantine_channel = uuid4()
     visible = None
+    air_routes = {}
+    air_feeders = {}
+    air_playing = set()
+    next_prepare = 0.0
+    epoch = 0
+    unix_offset = 0
+    sample_rate = source.info.sample_rate
+
+    def refresh_airplay():
+        nonlocal air_routes, next_prepare
+        if airplay is None:
+            return
+        routes = {ep.client_id: (ep, airplay.devices[ep.client_id])
+                  for ep in config.endpoints
+                  if ep.transport == "airplay" and ep.client_id in airplay.devices}
+        changed = {key for key, old in air_routes.items() if routes.get(key) != old}
+        for device_id in changed:
+            airplay.call(airplay.outputs.stop, device_id, device_id)
+            air_playing.discard(device_id)
+            air_feeders.pop(device_id, None)
+        now = loop.time()
+        for device_id, (ep, device) in routes.items():
+            if air_routes.get(device_id) != (ep, device) or now >= next_prepare:
+                airplay.call(airplay.outputs.prepare, device_id, device, sample_rate=sample_rate,
+                             channels=len(ep.source_channels), mode=ep.airplay_mode)
+        if now >= next_prepare:
+            next_prepare = now + 0.5
+        air_routes = routes
+
+    def stop_airplay():
+        nonlocal next_prepare
+        if air_playing:
+            for device_id in air_playing:
+                airplay.call(airplay.outputs.stop, device_id, device_id)
+            air_playing.clear()
+            next_prepare = 0.0
+        air_feeders.clear()
 
     def on_event(_, event):
         nonlocal transport_changed
@@ -307,28 +399,39 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
     unsubscribe = server.add_event_listener(on_event)
 
     async def stop():
-        nonlocal group, stream, previous, anchor
+        nonlocal group, stream, previous, anchor, presentation_start, sent_frames
         if group is not None:
             await group.stop()
-        group = stream = previous = anchor = None
+        group = stream = previous = anchor = presentation_start = None
+        sent_frames = 0
         feeders.clear()
+        stop_airplay()
+
+    async def apply_routes():
+        nonlocal config, channel_ids, visible
+        updated = web.at_boundary(config)
+        if _sendspin_config(updated).endpoints != _sendspin_config(config).endpoints:
+            await stop()
+            visible = None
+            channel_ids = {ep.name: uuid4() for ep in updated.endpoints}
+        config = updated
 
     try:
+        if web is not None:
+            await apply_routes()
         while True:
+            refresh_airplay()
             try:
                 chunk = await asyncio.wait_for(source.read(), timeout=gap_limit)
             except TimeoutError:
                 await stop()
                 if web is not None:
                     input_generation = None
+                    await apply_routes()
                 continue
             if web is not None and input_generation != chunk.generation:
-                updated = web.at_boundary(config)
-                if updated.endpoints != config.endpoints:
-                    await stop()
-                    visible = None
-                    channel_ids = {ep.name: uuid4() for ep in updated.endpoints}
-                config = updated
+                await apply_routes()
+                refresh_airplay()
                 input_generation = chunk.generation
             topology = tuple((c.client_id, c.connection, c.name) for c in server.connected_clients)
             matches = _match_live_clients(server, config, report=topology != visible)
@@ -353,16 +456,18 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
             stale = loop.time() - chunk.received_at > gap_limit
             drift = (anchor is not None and
                      abs(loop.time() - (anchor + sent_frames / source.info.sample_rate)) > gap_limit)
-            if transport_changed or changed or discontinuity or stale or drift:
+            receivers_changed = changed or (transport_changed and stream is not None)
+            if receivers_changed or discontinuity or stale or drift:
                 if stream is not None:
                     _LOG.info("Restarting live stream (receivers=%s, source discontinuity=%s, stale=%s, drift=%s)",
-                              changed or transport_changed, discontinuity, stale, drift)
+                              receivers_changed, discontinuity, stale, drift)
                 await stop()
             transport_changed = False
             active = signature
-            if not matches or stale:
+            has_airplay_routes = airplay is not None and any(ep.transport == "airplay" for ep in config.endpoints)
+            if stale or (not matches and not has_airplay_routes):
                 continue
-            if stream is None:
+            if matches and stream is None:
                 group = next(iter(matches.values())).group
                 for member in list(group.clients):
                     if member not in matches.values():
@@ -399,12 +504,13 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
                 sent_frames = 0
                 presentation_start = None
                 continue
-            split = split_int16_interleaved(chunk.pcm, source.info.channels, routes)
-            for ep in config.endpoints:
-                if ep.name in matches:
-                    feeders[ep.name].feed(_endpoint_pcm(ep, split[ep.name]))
-                    pcm = feeders[ep.name].pull()
-                    stream.prepare_audio(pcm, formats[ep.name], channel_id=channel_ids[ep.name])
+            if stream is not None:
+                split = split_int16_interleaved(chunk.pcm, source.info.channels, routes)
+                for ep in config.endpoints:
+                    if ep.name in matches:
+                        feeders[ep.name].feed(_endpoint_pcm(ep, split[ep.name]))
+                        pcm = feeders[ep.name].pull()
+                        stream.prepare_audio(pcm, formats[ep.name], channel_id=channel_ids[ep.name])
             if anchor is None:
                 anchor = loop.time()
             if presentation_start is None:
@@ -413,10 +519,29 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
                     for role in client.active_roles:
                         if role.get_audio_requirements() is not None:
                             lead_us = max(lead_us, role.get_min_buffer_us() + role.get_output_delay_us() + 10_000)
-                presentation_start = stream.now_us() + lead_us
+                now_us = server.clock.now_us()
+                if airplay is not None:
+                    # Keep this clock conversion fixed for the sample epoch.
+                    unix_offset = time_ns() // 1000 - now_us
+                presentation_start = now_us + lead_us
+                epoch += 1
                 _LOG.info("Live timeline anchored at %d us for %s", presentation_start, list(matches))
             timestamp = presentation_start + sent_frames * 1_000_000 // source.info.sample_rate
-            await stream.commit_audio(play_start_us=timestamp)
+            if stream is not None:
+                await stream.commit_audio(play_start_us=timestamp)
+            if air_routes:
+                air_pcm = split_int16_interleaved(chunk.pcm, source.info.channels,
+                                                  {key: ep.source_channels for key, (ep, _) in air_routes.items()})
+                for device_id, (ep, device) in air_routes.items():
+                    channels = len(ep.source_channels)
+                    if device_id not in air_feeders:
+                        air_feeders[device_id] = _make_feeder(ep, sample_rate, source.frames_per_chunk, channels)
+                    feeder = air_feeders[device_id]
+                    feeder.feed(_endpoint_pcm(ep, air_pcm[device_id]))
+                    airplay.call(airplay.outputs.offer, device_id, device, epoch=epoch,
+                                 at_unix_us=timestamp + unix_offset, pcm=feeder.pull(),
+                                 sample_rate=sample_rate, channels=channels, mode=ep.airplay_mode)
+                    air_playing.add(device_id)
             sent_frames += source.frames_per_chunk
             previous = chunk
     finally:

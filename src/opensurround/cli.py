@@ -16,6 +16,7 @@ def main() -> None:
     p.add_argument("--format", choices=["s32le"], default="s32le")
     p.add_argument("-c", "--config", default="configs/4ch-demo.toml")
     p.add_argument("--state-dir", default=".opensurround")
+    p.add_argument("--airplay-socket", help="optional AirPlay agent Unix socket (FIFO only)")
     p.add_argument("--web", action="store_true", help="enable the web configuration UI")
     p.add_argument("--web-host", help="web listen address (default: 127.0.0.1)")
     p.add_argument("--web-port", type=int, help="web listen port (default: 8080)")
@@ -24,11 +25,15 @@ def main() -> None:
     args = p.parse_args()
     if bool(args.wav) == bool(args.input_pipe):
         p.error("provide either a WAV path or --input-pipe")
+    if args.airplay_socket is not None and not args.input_pipe:
+        p.error("--airplay-socket requires --input-pipe")
     if args.sample_rate <= 0 or args.channels <= 0:
         p.error("--sample-rate and --channels must be positive")
     if not args.web and any(arg is not None for arg in (args.web_host, args.web_port, args.web_token_file)):
         p.error("--web-host, --web-port and --web-token-file require --web")
     web_options = {}
+    if args.airplay_socket is not None:
+        web_options["airplay_socket"] = args.airplay_socket
     if args.web:
         from .web import WebControl
 

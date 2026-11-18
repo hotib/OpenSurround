@@ -3,6 +3,9 @@ from dataclasses import dataclass
 from pathlib import Path
 import tomllib
 
+AIRPLAY_MODES = ("auto", "native", "compat")
+
+
 @dataclass(frozen=True)
 class EndpointConfig:
     name: str
@@ -13,6 +16,8 @@ class EndpointConfig:
     client_id: str = ""
     muted: bool = False
     label: str | None = None
+    transport: str = "sendspin"
+    airplay_mode: str = "auto"
 
 @dataclass(frozen=True)
 class Config:
@@ -35,17 +40,31 @@ def parse_config(text: str, *, allow_empty: bool = False) -> Config:
     server = data.get("server", {})
     audio = data.get("audio", {})
     endpoints = []
+    device_ids = set()
     for name, cfg in data.get("endpoints", {}).items():
         ch = tuple(int(x) for x in cfg["source_channels"])
         if len(ch) not in (1, 2):
             raise ValueError(f"endpoint {name}: source_channels must contain 1 (mono) or 2 (stereo) channels")
+        transport = cfg.get("transport", "sendspin")
+        mode = cfg.get("airplay_mode", "auto")
+        client_id = str(cfg.get("client_id", ""))
+        if transport not in ("sendspin", "airplay") or mode not in AIRPLAY_MODES:
+            raise ValueError(f"endpoint {name}: invalid transport or AirPlay mode")
+        if transport == "airplay" and not client_id.strip():
+            raise ValueError(f"endpoint {name}: AirPlay requires client_id")
+        if client_id and client_id in device_ids:
+            raise ValueError(f"endpoint {name}: duplicate client_id")
+        if client_id:
+            device_ids.add(client_id)
         endpoints.append(EndpointConfig(
             name,
             str(cfg.get("match_name", "")) if cfg.get("client_id") else str(cfg["match_name"]),
             ch,
             gain_db=float(cfg.get("gain_db", 0.0)),
             delay_ms=float(cfg.get("delay_ms", 0.0)),
-            client_id=str(cfg.get("client_id", "")),
+            client_id=client_id,
+            transport=transport,
+            airplay_mode=mode,
             muted=bool(cfg.get("muted", False)),
             label=str(cfg["label"]) if "label" in cfg else None,
         ))

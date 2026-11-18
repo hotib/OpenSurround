@@ -82,18 +82,42 @@ function markDirty() {
   updateActions();
 }
 
+const transportName = (device) => device.transport === "airplay" ? "AirPlay" : "Sendspin";
+const deviceKey = (transport, id) => id ? transport + ":" + id : "";
+
+async function pairDevice(device) {
+  if (busy) return;
+  busy = true;
+  epoch += 1;
+  updateActions();
+  try {
+    setError();
+    const id = device.id;
+    await request("/api/airplay/pair/begin", "POST", {id});
+    const pin = window.prompt("Add meg az AirPlay-eszközön látható PIN-t.");
+    if (pin === null) return;
+    await request("/api/airplay/pair/finish", "POST", {id, pin: pin.trim()});
+    notice = "Az AirPlay-eszköz párosítva.";
+  } catch (error) {
+    showFailure(error);
+  } finally {
+    busy = false;
+    updateActions();
+  }
+}
+
 function fillDeviceSelect(select, route) {
-  const selected = route.client_id;
+  const selected = deviceKey(route.transport, route.client_id);
   const options = [];
   if (!selected || route.match_name) {
     options.push(new Option(route.match_name ? "Egyezés névrészlet alapján" : "Válassz eszközt", ""));
   }
   for (const device of snapshot.devices) {
-    options.push(new Option(device.name + " · " + device.id +
-      (device.connected ? "" : " (leválasztva)"), device.id));
+    options.push(new Option(device.name + " · " + transportName(device) + " · " + device.id +
+      (device.connected ? "" : " (leválasztva)"), deviceKey(device.transport, device.id)));
   }
-  if (selected && !snapshot.devices.some((device) => device.id === selected)) {
-    options.push(new Option(selected + " (leválasztva)", selected));
+  if (selected && !snapshot.devices.some((device) => deviceKey(device.transport, device.id) === selected)) {
+    options.push(new Option(route.client_id + " (leválasztva)", selected));
   }
   select.replaceChildren(...options);
   select.value = selected;
@@ -101,7 +125,15 @@ function fillDeviceSelect(select, route) {
 }
 
 function connectionState(element, route) {
-  const receivers = snapshot.devices.filter((device) => device.connected && (
+  if (route.transport === "airplay") {
+    const device = snapshot.devices.find((item) => item.transport === "airplay" && item.id === route.client_id);
+    const labels = {offline: "Nem elérhető", connecting: "Kapcsolódás", ready: "Készen áll",
+      playing: "Lejátszás", late: "Késés", error: "Hiba"};
+    element.classList.toggle("online", ["ready", "playing"].includes(device?.status));
+    element.textContent = device?.error || labels[device?.status] || device?.status || labels.offline;
+    return;
+  }
+  const receivers = snapshot.devices.filter((device) => device.transport === "sendspin" && device.connected && (
     route.client_id ? device.id === route.client_id :
       route.match_name && device.name.toLowerCase().includes(route.match_name.toLowerCase())
   ));
@@ -111,7 +143,7 @@ function connectionState(element, route) {
 }
 
 function refreshInventory(force = false) {
-  const signature = JSON.stringify(snapshot.devices);
+  const signature = JSON.stringify([snapshot.devices, snapshot.endpoints]);
   if (!force && signature === lastInventory) return;
   lastInventory = signature;
   const list = byId("devices");
@@ -123,13 +155,13 @@ function refreshInventory(force = false) {
     const title = document.createElement("strong");
     title.textContent = device.name;
     const id = document.createElement("small");
-    id.textContent = device.id;
+    id.textContent = transportName(device) + " · " + device.id;
     const status = document.createElement("span");
-    connectionState(status, {client_id: device.id});
+    connectionState(status, {client_id: device.id, transport: device.transport});
     status.classList.add("connection");
     row.append(title, id, status);
     const mapped = draft.some((route) => route.client_id === device.id ||
-      (!route.client_id && route.match_name &&
+      (device.transport === "sendspin" && !route.client_id && route.match_name &&
        device.name.toLowerCase().includes(route.match_name.toLowerCase())));
     if (device.connected && !mapped) {
       const add = document.createElement("button");
@@ -140,6 +172,7 @@ function refreshInventory(force = false) {
       add.addEventListener("click", () => {
         draft.push({
           key: null, label: device.name, client_id: device.id, match_name: "",
+          transport: device.transport, airplay_mode: "auto",
           source_channels: [0], gain_db: 0, delay_ms: 0, muted: false,
         });
         markDirty();
@@ -147,6 +180,14 @@ function refreshInventory(force = false) {
       });
       row.append(add);
       if (focused === device.id) add.focus();
+    }
+    if (device.transport === "airplay" && device.connected && snapshot.endpoints.some(
+      (route) => route.transport === "airplay" && route.client_id === device.id)) {
+      const pair = document.createElement("button");
+      pair.type = "button";
+      pair.textContent = "Párosítás";
+      pair.addEventListener("click", () => pairDevice(device));
+      row.append(pair);
     }
     list.append(row);
   }
@@ -174,8 +215,16 @@ function renderRoutes() {
       legacy.hidden = Boolean(route.client_id);
       input("match_name").required = !route.client_id;
     };
+    const mode = input("airplay_mode");
+    const updateMode = () => { mode.closest("label").hidden = route.transport !== "airplay"; };
+    mode.value = route.airplay_mode;
+    mode.addEventListener("change", () => {
+      route.airplay_mode = mode.value;
+      markDirty();
+    });
     updateLabel();
     updateLegacy();
+    updateMode();
     for (const name of ["label", "match_name", "gain_db", "delay_ms"]) {
       const field = input(name);
       field.value = route[name];
@@ -191,8 +240,16 @@ function renderRoutes() {
     }
     input("client_id").addEventListener("blur", () => fillDeviceSelect(input("client_id"), route));
     input("client_id").addEventListener("change", ({target}) => {
-      route.client_id = target.value;
+      const selected = snapshot.devices.find((device) => deviceKey(device.transport, device.id) === target.value);
+      if (target.value && !selected) return;
+      route.client_id = selected?.id || "";
+      route.transport = selected?.transport || "sendspin";
+      if (route.transport === "airplay") {
+        route.match_name = "";
+        input("match_name").value = "";
+      }
       updateLegacy();
+      updateMode();
       connectionState(connection, route);
       refreshInventory(true);
       markDirty();

@@ -27,7 +27,7 @@
       <div class="heading">
         <div>
           <h1>Hangútvonalak</h1>
-          <p class="subtle">Válaszd ki, melyik bemeneti csatorna melyik Sendspin-eszközön szóljon.</p>
+          <p class="subtle">Válaszd ki, melyik bemeneti csatorna melyik eszközön szóljon.</p>
         </div>
         <div id="channel-list" class="channel-list" aria-label="Bemeneti csatornák"></div>
       </div>
@@ -48,7 +48,7 @@
           </div>
         </form>
         <aside class="panel inventory" aria-labelledby="devices-title">
-          <h2 id="devices-title">Sendspin-eszközök</h2>
+          <h2 id="devices-title">Kimeneti eszközök</h2>
           <p id="empty-devices" class="subtle" hidden>Az eszközök akkor jelennek meg, amikor csatlakoznak az OpenSurroundhoz.</p>
           <ul id="devices"></ul>
         </aside>
@@ -64,7 +64,14 @@
       </div>
       <div class="fields">
         <label>Útvonal neve<input data-field="label" required></label>
-        <label>Sendspin-eszköz<select data-field="client_id" required></select></label>
+        <label>Kimeneti eszköz<select data-field="client_id" required></select></label>
+        <label class="airplay-mode" hidden>AirPlay-mód
+          <select data-field="airplay_mode">
+            <option value="auto">Automatikus</option>
+            <option value="native">Natív</option>
+            <option value="compat">Kompatibilis</option>
+          </select>
+        </label>
         <label class="legacy" hidden>Névrészlet a párosításhoz<input data-field="match_name"></label>
         <label>Első forrás<select data-field="first" required></select></label>
         <label>Második forrás<select data-field="second"></select></label>

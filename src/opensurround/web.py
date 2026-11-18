@@ -82,10 +82,10 @@ class WebControl:
         return replace(config, endpoints=endpoints) if endpoints != config.endpoints else config
 
     @asynccontextmanager
-    async def serve(self, server, channels: int):
+    async def serve(self, server, channels: int, *, airplay=None):
         store = RouteStore(self.config_path, channels)
         self.saved = await asyncio.to_thread(store.read)
-        app = self.make_app(store, lambda: sendspin_devices(server))
+        app = self.make_app(store, lambda: sendspin_devices(server), airplay=airplay)
         runner = web.AppRunner(app, access_log=None)
         await runner.setup()
         try:
@@ -95,8 +95,9 @@ class WebControl:
         finally:
             await runner.cleanup()
 
-    def make_app(self, store: RouteStore, devices) -> web.Application:
+    def make_app(self, store: RouteStore, devices, *, airplay=None) -> web.Application:
         lock = asyncio.Lock()
+        pairing = asyncio.Lock()
 
         @web.middleware
         async def protect(request, handler):
@@ -124,17 +125,29 @@ class WebControl:
 
         def state(snapshot):
             channels = _CHANNELS_51 if store.channels == 6 else tuple(str(i + 1) for i in range(store.channels))
+            inventory = devices()
+            discovered = airplay.devices if airplay is not None else {}
+            known = {ep.client_id for ep in snapshot.config.endpoints if ep.transport == "airplay"}
+            for device_id in sorted(known | discovered.keys()):
+                device = discovered.get(device_id)
+                status = airplay.status(device_id) if airplay is not None else "offline"
+                inventory.append({
+                    "id": device_id, "name": device.name if device else device_id,
+                    "transport": "airplay", "connected": device is not None,
+                    "status": status, "error": "AirPlay-kimeneti hiba." if status == "error" else None,
+                })
             return web.json_response({
                 "revision": snapshot.id,
                 "can_restore": snapshot.can_restore,
                 "pending": self.active_endpoints != snapshot.config.endpoints,
                 "channels": channels,
-                "devices": devices(),
+                "devices": inventory,
                 "endpoints": [
                     {"key": ep.name, "label": ep.label if ep.label is not None else ep.name,
                      "match_name": ep.match_name, "client_id": ep.client_id,
                      "source_channels": ep.source_channels, "gain_db": ep.gain_db,
-                     "delay_ms": ep.delay_ms, "muted": ep.muted}
+                     "delay_ms": ep.delay_ms, "muted": ep.muted, "transport": ep.transport,
+                     "airplay_mode": ep.airplay_mode}
                     for ep in snapshot.config.endpoints
                 ],
             })
@@ -173,6 +186,41 @@ class WebControl:
                 self.saved = snapshot
                 return state(snapshot)
 
+        async def pair(request):
+            if request.content_type != "application/json":
+                return web.json_response({"error": "JSON kérés szükséges."}, status=415)
+            finish = request.match_info["action"] == "finish"
+            try:
+                payload = await request.json()
+                device_id = payload.get("id")
+                pin = payload.get("pin")
+                if not isinstance(device_id, str) or (finish and (
+                        not isinstance(pin, str) or not re.fullmatch(r"[0-9]{4,8}", pin))):
+                    raise ValueError
+            except (AttributeError, ValueError):
+                return web.json_response({"error": "Érvénytelen eszközazonosító vagy PIN."}, status=400)
+            snapshot = self.saved
+            if snapshot is None or not any(ep.transport == "airplay" and ep.client_id == device_id
+                                           for ep in snapshot.config.endpoints):
+                return web.json_response({"error": "Előbb mentsd az eszköz útvonalát."}, status=404)
+            device = airplay.devices.get(device_id) if airplay is not None else None
+            if device is None:
+                return web.json_response({"error": "Az AirPlay-eszköz nem érhető el."}, status=503)
+            if pairing.locked():
+                return web.json_response({"error": "Egy párosítási kérés már fut."}, status=409)
+            async with pairing:
+                try:
+                    async with asyncio.timeout(8):
+                        if finish:
+                            await airplay.outputs.pair_finish(device, pin)
+                        else:
+                            await airplay.outputs.pair_begin(device)
+                except TimeoutError:
+                    return web.json_response({"error": "A párosítási kérés időtúllépés miatt megszakadt."}, status=504)
+                except (ValueError, OSError, RuntimeError):
+                    return web.json_response({"error": "Az AirPlay-párosítás sikertelen."}, status=502)
+            return web.json_response({"ok": True})
+
         async def index(request):
             return web.FileResponse(_ASSETS / "index.html")
 
@@ -189,4 +237,5 @@ class WebControl:
         app.router.add_get("/api/state", get_state)
         app.router.add_put("/api/routes", edit)
         app.router.add_post("/api/restore", edit)
+        app.router.add_post(r"/api/airplay/pair/{action:begin|finish}", pair)
         return app
