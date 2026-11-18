@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from aiohttp import web
 
 from .config import Config
+from .sendspin_demand import LiveSendspinServer
 from .web_store import NoPreviousRevision, RevisionConflict, RouteStore
 
 _LOG = logging.getLogger("opensurround.web")
@@ -57,12 +58,22 @@ def _read_token(path: str) -> bytes:
 
 def sendspin_devices(server) -> list[dict]:
     """Inventory adapter for the transport-agnostic settings response."""
-    return [
-        {"id": client.client_id, "name": client.name or client.client_id, "transport": "sendspin",
-         "connected": client.is_connected}
+    devices = {
+        client.client_id: {"id": client.client_id, "name": client.name or client.client_id,
+                           "transport": "sendspin", "connected": client.is_connected}
         for client in server.clients
         if client.info_or_none is not None and client.info_or_none.player_support is not None
-    ]
+    }
+    if isinstance(server, LiveSendspinServer):
+        for url, ad in server.advertisements.items():
+            identifier = server.get_client_id_for_url(url)
+            device_id = identifier or f"mdns:{url}"
+            device = devices.setdefault(device_id, {
+                "id": device_id, "name": ad.name, "transport": "sendspin",
+                "connected": False, "discovery_only": identifier is None,
+            })
+            device["discovered"] = True
+    return list(devices.values())
 
 
 class WebControl:

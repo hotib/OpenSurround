@@ -87,6 +87,8 @@ function markDirty() {
 
 const transportName = (device) => device.transport === "airplay" ? "AirPlay" : "Sendspin";
 const deviceKey = (transport, id) => id ? transport + ":" + id : "";
+const matchesName = (route, device) => route.match_name &&
+  device.name.toLowerCase().includes(route.match_name.toLowerCase());
 
 async function pairDevice(device) {
   if (busy) return;
@@ -117,7 +119,7 @@ function fillDeviceSelect(select, route) {
   }
   for (const device of snapshot.devices) {
     options.push(new Option(device.name + " · " + transportName(device) + " · " + device.id +
-      (device.connected ? "" : " (leválasztva)"), deviceKey(device.transport, device.id)));
+      (device.connected || device.discovered ? "" : " (leválasztva)"), deviceKey(device.transport, device.id)));
   }
   if (selected && !snapshot.devices.some((device) => deviceKey(device.transport, device.id) === selected)) {
     options.push(new Option(route.client_id + " (leválasztva)", selected));
@@ -137,12 +139,16 @@ function connectionState(element, route) {
     return;
   }
   const receivers = snapshot.devices.filter((device) => device.transport === "sendspin" && device.connected && (
-    route.client_id ? device.id === route.client_id :
-      route.match_name && device.name.toLowerCase().includes(route.match_name.toLowerCase())
+    route.client_id ? device.id === route.client_id : matchesName(route, device)
+  ));
+  const discovered = snapshot.devices.some((device) => device.transport === "sendspin" && device.discovered && (
+    device.id === route.client_id ||
+    ((!route.client_id || device.discovery_only) && matchesName(route, device))
   ));
   element.classList.toggle("online", receivers.length === 1);
   element.textContent = receivers.length > 1 ? "Több egyező eszköz" :
-    receivers.length === 1 ? "Csatlakoztatva" : "Nincs csatlakoztatva";
+    receivers.length === 1 ? "Csatlakoztatva" :
+    discovered ? "Felderítve" : "Nincs csatlakoztatva";
 }
 
 function refreshInventory(force = false) {
@@ -164,9 +170,8 @@ function refreshInventory(force = false) {
     status.classList.add("connection");
     row.append(title, id, status);
     const mapped = draft.some((route) => route.client_id === device.id ||
-      (device.transport === "sendspin" && !route.client_id && route.match_name &&
-       device.name.toLowerCase().includes(route.match_name.toLowerCase())));
-    if (device.connected && !mapped) {
+      (device.transport === "sendspin" && (!route.client_id || device.discovery_only) && matchesName(route, device)));
+    if ((device.connected || device.discovered) && !mapped) {
       const add = document.createElement("button");
       add.type = "button";
       add.textContent = "Útvonal hozzáadása";
@@ -174,7 +179,8 @@ function refreshInventory(force = false) {
       add.dataset.device = device.id;
       add.addEventListener("click", () => {
         draft.push({
-          key: null, label: device.name, client_id: device.id, match_name: "",
+          key: null, label: device.name, client_id: device.discovery_only ? "" : device.id,
+          match_name: device.transport === "sendspin" ? device.name : "",
           transport: device.transport, airplay_mode: "auto",
           source_channels: [0], gain_db: 0, delay_ms: 0, muted: false,
         });
@@ -245,11 +251,11 @@ function renderRoutes() {
     input("client_id").addEventListener("change", ({target}) => {
       const selected = snapshot.devices.find((device) => deviceKey(device.transport, device.id) === target.value);
       if (target.value && !selected) return;
-      route.client_id = selected?.id || "";
+      route.client_id = selected?.discovery_only ? "" : selected?.id || "";
       route.transport = selected?.transport || "sendspin";
-      if (route.transport === "airplay") {
-        route.match_name = "";
-        input("match_name").value = "";
+      if (selected) {
+        route.match_name = route.transport === "sendspin" ? selected.name : "";
+        input("match_name").value = route.match_name;
       }
       updateLegacy();
       updateMode();

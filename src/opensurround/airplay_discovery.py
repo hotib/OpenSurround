@@ -1,15 +1,12 @@
 """Local AirPlay receiver discovery, independent of the FIFO playback loop."""
 from __future__ import annotations
 
-import asyncio
-from contextlib import asynccontextmanager
 from ipaddress import ip_address
 
 import ifaddr
-from zeroconf import IPVersion, ServiceStateChange
-from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
 from .airplay import AirPlayDevice
+from .mdns_discovery import discover_devices
 
 _SERVICE = "_airplay._tcp.local."
 
@@ -40,52 +37,11 @@ def _device(info, local_ips: set[str]) -> AirPlayDevice | None:
     return AirPlayDevice(device_id, info.name.removesuffix("." + _SERVICE), address, info.port, txt)
 
 
-@asynccontextmanager
-async def discover_airplay(devices: dict[str, AirPlayDevice]):
+def discover_airplay(devices: dict[str, AirPlayDevice]):
     local_ips = _local_ips()
-    zeroconf = AsyncZeroconf(ip_version=IPVersion.All)
-    services: dict[str, AirPlayDevice] = {}
-    pending: dict[str, asyncio.Task] = {}
 
-    def publish():
-        devices.clear()
-        devices.update((device.id, device) for _, device in sorted(services.items()))
+    def decode(info):
+        if device := _device(info, local_ips):
+            return device.id, device
 
-    async def resolve(zc, name):
-        try:
-            info = AsyncServiceInfo(_SERVICE, name)
-            if await info.async_request(zc, 1500):
-                device = _device(info, local_ips)
-                if device is not None:
-                    services[name] = device
-                else:
-                    services.pop(name, None)
-                publish()
-        except (OSError, ValueError):
-            pass
-        finally:
-            if pending.get(name) is asyncio.current_task():
-                pending.pop(name)
-
-    def changed(zeroconf, service_type, name, state_change):
-        if name in pending:
-            pending.pop(name).cancel()
-        if state_change is ServiceStateChange.Removed:
-            services.pop(name, None)
-            publish()
-        else:
-            pending[name] = asyncio.create_task(resolve(zeroconf, name))
-
-    try:
-        browser = AsyncServiceBrowser(zeroconf.zeroconf, _SERVICE, handlers=[changed])
-        try:
-            yield
-        finally:
-            await browser.async_cancel()
-            tasks = list(pending.values())
-            for task in tasks:
-                task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-            devices.clear()
-    finally:
-        await zeroconf.async_close()
+    return discover_devices(_SERVICE, devices, decode)

@@ -206,7 +206,7 @@ source_channels = [0]
             sequence = 0
 
             async def read(self):
-                assert prepared
+                assert bool(prepared) == (self.sequence > 0)
                 self.sequence += 1
                 if self.sequence > 3:
                     raise EOFError

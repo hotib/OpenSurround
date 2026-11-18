@@ -249,6 +249,11 @@ delay_ms = 0.0
   blocking reader threads. At 20 ms, each input chunk is 960 frames / 23040 bytes,
   converted to 11520 output bytes. Only three completed chunks plus less than one
   partial input chunk are retained, in addition to the bounded kernel FIFO.
+- Speaker discovery continues while idle. Live PCM starts connections to the
+  configured speakers and three seconds without a complete PCM chunk releases
+  them. For Sendspin devices whose advertised instance differs from `client_id`,
+  retain the advertised name as `match_name` so the device can be found before
+  its client ID is verified during the handshake.
 - Each available, uniquely matched endpoint gets its configured channels. An
   offline endpoint does not hold up other endpoints. Multiple matching clients,
   or one client matching multiple endpoints, are withheld instead of assigning

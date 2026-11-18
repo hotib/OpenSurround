@@ -16,6 +16,7 @@ from aiosendspin.server.server import ClientConnectedEvent, ClientDisconnectedEv
 
 from .config import Config, EndpointConfig
 from .routing import ChunkFeeder, gain_int16, split_int16_interleaved
+from .sendspin_demand import LiveSendspinServer
 from .wav_source import WavSource
 from .pipe_source import PipePCMSource
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from .web import WebControl
 
 _LOG = logging.getLogger("opensurround")
+_SPEAKER_IDLE_SECONDS = 3.0
 
 
 def _load_or_create_identity(path: Path) -> Identity:
@@ -154,7 +156,8 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
         # Kiosk Satellite: once "known", an unencrypted connection claiming that
         # client_id is rejected as a possible identity spoof.
         pairing_store = InMemoryServerPairingStore()
-    server = SendspinServer(
+    server_type = LiveSendspinServer if input_pipe else SendspinServer
+    server = server_type(
         loop,
         identity,
         config.server_name,
@@ -165,7 +168,13 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
     try:
         if input_pipe:
             source.start()
-        await server.start_server(port=config.port, host=config.host, discover_clients=True)
+        await server.start_server(port=config.port, host=config.host,
+                                  discover_clients=not input_pipe)
+        if isinstance(server, LiveSendspinServer):
+            try:
+                await services.enter_async_context(server.discover())
+            except OSError:
+                _LOG.warning("Sendspin mDNS discovery unavailable")
         _LOG.info("Sendspin server listening on %s:%s", config.host, config.port)
         _LOG.info("Point Kiosk Satellite Sendspin 'Server' to <this-host>:%s if discovery picks Music Assistant instead.", config.port)
 
@@ -343,6 +352,8 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
     input_generation = None
     channel_ids = {ep.name: uuid4() for ep in config.endpoints}
     previous = None
+    last_audio = None
+    live_sendspin = server if isinstance(server, LiveSendspinServer) else None
     # Restart before drift exhausts the lead, not after sending late audio.
     gap_limit = source.interruption_timeout
     anchor = None
@@ -353,6 +364,7 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
     visible = None
     air_routes = {}
     air_feeders = {}
+    air_prepared = set()
     air_playing = set()
     next_prepare = 0.0
     epoch = 0
@@ -369,6 +381,7 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
         changed = {key for key, old in air_routes.items() if routes.get(key) != old}
         for device_id in changed:
             airplay.call(airplay.outputs.stop, device_id, device_id)
+            air_prepared.discard(device_id)
             air_playing.discard(device_id)
             air_feeders.pop(device_id, None)
         now = loop.time()
@@ -376,15 +389,18 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
             if air_routes.get(device_id) != (ep, device) or now >= next_prepare:
                 airplay.call(airplay.outputs.prepare, device_id, device, sample_rate=sample_rate,
                              channels=len(ep.source_channels), mode=ep.airplay_mode)
+                air_prepared.add(device_id)
         if now >= next_prepare:
             next_prepare = now + 0.5
         air_routes = routes
 
-    def stop_airplay():
+    def stop_airplay(all_outputs=False):
         nonlocal next_prepare
-        if air_playing:
-            for device_id in air_playing:
+        stopped = air_prepared | air_playing if all_outputs else air_playing
+        if stopped:
+            for device_id in stopped:
                 airplay.call(airplay.outputs.stop, device_id, device_id)
+            air_prepared.difference_update(stopped)
             air_playing.clear()
             next_prepare = 0.0
         air_feeders.clear()
@@ -400,14 +416,14 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
 
     unsubscribe = server.add_event_listener(on_event)
 
-    async def stop():
+    async def stop(*, all_outputs=False):
         nonlocal group, stream, previous, anchor, presentation_start, sent_frames
         if group is not None:
             await group.stop()
         group = stream = previous = anchor = presentation_start = None
         sent_frames = 0
         feeders.clear()
-        stop_airplay()
+        stop_airplay(all_outputs)
 
     async def apply_routes():
         nonlocal config, channel_ids, visible
@@ -422,19 +438,29 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
         if web is not None:
             await apply_routes()
         while True:
-            refresh_airplay()
             try:
                 chunk = await asyncio.wait_for(source.read(), timeout=gap_limit)
             except TimeoutError:
-                await stop()
+                idle = last_audio is not None and loop.time() - last_audio >= _SPEAKER_IDLE_SECONDS
+                await stop(all_outputs=idle)
+                if idle:
+                    if live_sendspin is not None:
+                        await live_sendspin.release_speakers()
+                    air_routes.clear()
+                    last_audio = None
                 if web is not None:
                     input_generation = None
                     await apply_routes()
                 continue
             if web is not None and input_generation != chunk.generation:
                 await apply_routes()
-                refresh_airplay()
                 input_generation = chunk.generation
+            now = loop.time()
+            if now - chunk.received_at <= gap_limit:
+                last_audio = chunk.received_at
+                if live_sendspin is not None:
+                    live_sendspin.connect_routes(config.endpoints, now)
+                refresh_airplay()
             topology = tuple((c.client_id, c.connection, c.name) for c in server.connected_clients)
             matches = _match_live_clients(server, config, report=topology != visible)
             visible = topology
@@ -548,4 +574,6 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
             previous = chunk
     finally:
         unsubscribe()
-        await stop()
+        await stop(all_outputs=True)
+        if live_sendspin is not None:
+            await live_sendspin.release_speakers()

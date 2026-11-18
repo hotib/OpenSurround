@@ -9,6 +9,7 @@ from pathlib import Path
 import socket
 import tempfile
 
+from aiohttp import ClientSession, WSServerHandshakeError
 import numpy as np
 from aiosendspin.client.client import SendspinClient
 from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
@@ -67,7 +68,15 @@ async def exercise(root: Path, writer_first: bool):
         collector = Collector()
         client.add_audio_chunk_listener(collector)
         try:
-            await client.connect(f'ws://127.0.0.1:{port}/sendspin')
+            async with asyncio.timeout(5):
+                while True:
+                    try:
+                        await client.connect(f'ws://127.0.0.1:{port}/sendspin')
+                        break
+                    except WSServerHandshakeError as exc:
+                        if exc.status != 503:
+                            raise
+                        await asyncio.sleep(.05)
         except BaseException:
             await client.disconnect()
             raise
@@ -87,6 +96,9 @@ async def exercise(root: Path, writer_first: bool):
                 except OSError:
                     await asyncio.sleep(.01)
         if writer_task is None:
+            async with ClientSession() as session:
+                async with session.get(f'http://127.0.0.1:{port}/sendspin') as response:
+                    assert response.status == 503
             writer_task = asyncio.create_task(writer.run())
         # Active input with every receiver offline must continue flowing.
         await writer.wait_blocks(20)
@@ -137,6 +149,22 @@ async def exercise(root: Path, writer_first: bool):
         writer_task = asyncio.create_task(writer.run())
         await asyncio.gather(*(c.wait(lambda xs: len(xs) >= 20) for c in collectors))
         assert verify_shared(collectors, 300) > last + 450000
+        if not writer_first:
+            await cancel(writer_task)
+            writer_task = None
+            async with asyncio.timeout(6):
+                while any(client.connected for client in clients):
+                    await asyncio.sleep(.05)
+            async with ClientSession() as session:
+                async with session.get(f'http://127.0.0.1:{port}/sendspin') as response:
+                    assert response.status == 503
+            writer = LiveWriter(fifo, marker=700)
+            writer_task = asyncio.create_task(writer.run())
+            await writer.wait_blocks(2)
+            old = clients[0]
+            clients[0], collectors[0] = await connect(0, old.identity)
+            await old.disconnect()
+            await collectors[0].wait(lambda xs: len(xs) >= 20)
         assert not server_task.done(), 'live server stopped unexpectedly'
     finally:
         await cancel(writer_task)
