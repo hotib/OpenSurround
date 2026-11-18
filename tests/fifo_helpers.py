@@ -43,9 +43,10 @@ async def open_writer(path):
 
 
 class LiveWriter:
-    def __init__(self, path, marker=0):
+    def __init__(self, path, marker=0, *, batched=False):
         self.path = path
         self.marker = marker
+        self.batched = batched
         self.blocks = 0
         self.progress = asyncio.Event()
 
@@ -53,14 +54,19 @@ class LiveWriter:
         fd = await open_writer(self.path)
         loop = asyncio.get_running_loop()
         due = loop.time()
+        size = 5 if self.batched else 1
+        jitter = 0.02 if self.batched else 0
+        delay = 0
         try:
             while True:
-                await write_bytes(fd, pcm_block(self.marker))
-                self.blocks += 1
+                # The sample rate is constant even when the writer batches.
+                await asyncio.sleep(max(0, due + delay - loop.time()))
+                for _ in range(size):
+                    await write_bytes(fd, pcm_block(self.marker))
+                    self.blocks += 1
                 self.progress.set()
-                due += 0.02
-                # Simulate a hardware source clock, independently of readers.
-                await asyncio.sleep(max(0, due - loop.time()))
+                due += size * 0.02
+                delay = jitter - delay
         finally:
             os.close(fd)
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from math import ceil
 import os
 from pathlib import Path
 import stat
@@ -30,16 +31,21 @@ class PipePCMSource:
 
     def __init__(self, path: str | Path, chunk_ms: int = 20, *,
                  sample_rate: int = 48000, channels: int = 6,
-                 sample_format: str = "s32le", max_chunks: int = 3):
+                 sample_format: str = "s32le", max_chunks: int = 3, jitter_buffer_ms: float = 0):
         if sample_format != "s32le":
             raise ValueError("only s32le FIFO input is supported")
         if min(sample_rate, channels, chunk_ms, max_chunks) <= 0:
             raise ValueError("sample rate, channels, chunk duration and queue size must be positive")
+        if jitter_buffer_ms < 0:
+            raise ValueError("jitter buffer duration must be nonnegative")
         self.path = Path(path)
         self.info = WavInfo(sample_rate, channels, 16)
         self.frames_per_chunk = max(1, round(sample_rate * chunk_ms / 1000))
         self.input_chunk_bytes = self.frames_per_chunk * channels * 4
-        self.queue: asyncio.Queue[PCMChunk] = asyncio.Queue(maxsize=max_chunks)
+        chunk_seconds = self.frames_per_chunk / sample_rate
+        jitter_seconds = jitter_buffer_ms / 1000
+        capacity = max(max_chunks, ceil(jitter_seconds / chunk_seconds))
+        self.queue: asyncio.Queue[PCMChunk] = asyncio.Queue(maxsize=capacity)
         self.generation = 0
         self.dropped_chunks = 0
         self._sequence = 0
@@ -48,7 +54,7 @@ class PipePCMSource:
         self._fd: int | None = None
         self._retry: asyncio.TimerHandle | None = None
         self._idle: asyncio.TimerHandle | None = None
-        self.interruption_timeout = max(0.05, 3 * self.frames_per_chunk / sample_rate)
+        self.interruption_timeout = max(0.05, 3 * chunk_seconds, jitter_seconds)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._at_eof = False
         self._error: OSError | None = None

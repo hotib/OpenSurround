@@ -247,8 +247,9 @@ delay_ms = 0.0
 - The reader starts before Sendspin discovery completes. It drains even with no
   receivers. Nonblocking descriptor readiness callbacks do bounded work, with no
   blocking reader threads. At 20 ms, each input chunk is 960 frames / 23040 bytes,
-  converted to 11520 output bytes. Only three completed chunks plus less than one
-  partial input chunk are retained, in addition to the bounded kernel FIFO.
+  converted to 11520 output bytes. The bounded queue holds at least three
+  completed chunks and can absorb batches covering half the configured
+  `buffer_lead_ms`, up to 200 ms. The reader also holds a partial chunk.
 - Speaker discovery continues while idle. Live PCM starts connections to the
   configured speakers and three seconds without a complete PCM chunk releases
   them. For Sendspin devices whose advertised instance differs from `client_id`,
@@ -265,12 +266,13 @@ delay_ms = 0.0
   by exact frame counts; all endpoint payloads commit together. Sendspin may
   repacketize 20 ms input into 25 ms output. Gain and delay apply per route;
   configured delay buffers are reset with each stream.
-- PCM zero samples are ordinary audio. A short input gap keeps the timeline if
-  no data was lost. No replacement silence is generated. Missing input for three
-  chunks (at least 50 ms; 60 ms with this config), observed EOF, dropped chunks,
-  or timeline drift beyond that threshold causes a restart. Partial chunks are
-  discarded on interruption; a stalled writer's remaining incomplete frame bytes
-  are skipped to retain frame alignment.
+- PCM zero samples are ordinary audio. Short input gaps and bursts preserve the
+  shared timeline when the chunks arrive in sequence within the jitter window.
+  The window is half the configured lead up to 200 ms, with a minimum of three
+  chunks or 50 ms, whichever is greater. With a 300 ms lead it is 150 ms.
+  An input gap or drift beyond that window, EOF, or dropped chunks reanchors
+  the stream. No replacement silence is generated. Partial chunks are discarded
+  on interruption and any remaining bytes in the stalled frame are skipped.
 - Writer reconnect uses the same open FIFO descriptor. EOF readiness is disabled
   and retried every 100 ms to avoid CPU spin. Recovery drops old queued audio.
   The next stream calls the existing group stop/start lifecycle and anchors a

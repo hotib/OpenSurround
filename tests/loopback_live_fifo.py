@@ -53,7 +53,7 @@ async def exercise(root: Path, writer_first: bool):
         port = s.getsockname()[1]
     endpoints = tuple(EndpointConfig(n, n, (2*i, 2*i+1)) for i, n in enumerate(('LiveFront', 'LiveCenter', 'LiveRear')))
     config = Config('live-test', '127.0.0.1', port, 20, 300, True, False, endpoints)
-    writer = LiveWriter(fifo)
+    writer = LiveWriter(fifo, batched=not writer_first)
     writer_task = asyncio.create_task(writer.run()) if writer_first else None
     server_task = asyncio.create_task(run(config, state_dir=str(root / 'state'), input_pipe=str(fifo)))
     clients = []

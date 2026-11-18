@@ -135,8 +135,12 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
         raise ValueError("provide exactly one WAV or FIFO input")
     if airplay_socket is not None and not input_pipe:
         raise ValueError("AirPlay requires FIFO input")
+    # Reserve at least half of the configured lead for the renderer while
+    # accommodating irregular batches from the live writer.
+    jitter_buffer_ms = min(400, max(0, config.buffer_lead_ms)) / 2
     source = (PipePCMSource(input_pipe, config.chunk_ms, sample_rate=sample_rate,
-                            channels=channels, sample_format=sample_format)
+                            channels=channels, sample_format=sample_format,
+                            jitter_buffer_ms=jitter_buffer_ms)
               if input_pipe else WavSource(wav_path, config.chunk_ms))
     services = AsyncExitStack()
     try:
@@ -441,6 +445,9 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
             try:
                 chunk = await asyncio.wait_for(source.read(), timeout=gap_limit)
             except TimeoutError:
+                if previous is not None:
+                    gap_ms = (loop.time() - previous.received_at) * 1000
+                    _LOG.info("Restarting live stream after %.0f ms without PCM", gap_ms)
                 idle = last_audio is not None and loop.time() - last_audio >= _SPEAKER_IDLE_SECONDS
                 await stop(all_outputs=idle)
                 if idle:
