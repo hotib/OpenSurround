@@ -1,5 +1,19 @@
 # OpenSurround PoC
 
+## Web settings
+
+Add `--web` to the existing OpenSurround command and open
+`http://127.0.0.1:8080`. The web page reads the TOML passed with `-c`
+and edits its speaker routes. It supports individual mono/stereo channel
+selections, gain, delay, mute, and restoring the preceding save. Live
+route changes take effect at the next input pause or restart.
+
+For browser access from another computer on a trusted LAN, set
+`--web-host` to the LXC address and pass `--web-token-file` with a
+32–256 character URL-safe admin token. The token file must be owned
+by the service user and have mode `600`. Use HTTPS or an SSH tunnel
+when the network cannot be trusted.
+
 A deliberately small proof of concept for **different multichannel PCM pairs sent to different Sendspin clients on one synchronized timeline**.
 
 ## What this proves (once run against two real clients)

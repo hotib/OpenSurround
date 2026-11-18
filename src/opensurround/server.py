@@ -1,18 +1,24 @@
 from __future__ import annotations
 import asyncio
+from contextlib import AsyncExitStack
 import logging
 from pathlib import Path
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 from aiosendspin.noise.keys import Identity
 from aiosendspin.noise.trust_store import FileServerPairingStore, InMemoryServerPairingStore
 from aiosendspin.server import AudioFormat, SendspinServer
+from aiosendspin.server.roles.player.v1 import PlayerV1Role
 from aiosendspin.server.server import ClientConnectedEvent, ClientDisconnectedEvent
 
 from .config import Config, EndpointConfig
 from .routing import ChunkFeeder, gain_int16, split_int16_interleaved
 from .wav_source import WavSource
 from .pipe_source import PipePCMSource
+
+if TYPE_CHECKING:
+    from .web import WebControl
 
 _LOG = logging.getLogger("opensurround")
 
@@ -32,8 +38,7 @@ async def _wait_for_named_clients(server: SendspinServer, config: Config, timeou
         connected = server.connected_clients
         found = {}
         for ep in config.endpoints:
-            needle = ep.match_name.casefold()
-            matches = [c for c in connected if needle in (c.name or "").casefold()]
+            matches = [c for c in connected if _matches_endpoint(ep, c)]
             if len(matches) == 1:
                 found[ep.name] = matches[0]
         if len(found) == len(config.endpoints):
@@ -44,9 +49,44 @@ async def _wait_for_named_clients(server: SendspinServer, config: Config, timeou
         await asyncio.sleep(0.5)
 
 
-def _make_feeder(ep: EndpointConfig, sample_rate: int, frames_per_chunk: int) -> ChunkFeeder:
+def _matches_endpoint(endpoint: EndpointConfig, client) -> bool:
+    if endpoint.client_id:
+        return client.client_id == endpoint.client_id
+    return endpoint.match_name.casefold() in (client.name or "").casefold()
+
+
+def _playback_route(ep: EndpointConfig, client, *, managed: bool) -> tuple[int, ...]:
+    """Prefer the source channel count using the player's supported formats."""
+    route = ep.source_channels
+    if not managed and not ep.client_id:
+        return route
+    player = next((role for role in client.active_roles if isinstance(role, PlayerV1Role)), None)
+    if player is None or player.preferred_format is None:
+        return route
+    current = player.preferred_format
+    if len(route) != current.channels:
+        supported = [fmt for fmt in player.get_supported_formats() or () if fmt.channels == len(route)]
+        if supported:
+            fmt = min(supported, key=lambda fmt: (fmt.codec != player.preferred_codec,
+                                                 fmt.sample_rate != current.sample_rate,
+                                                 fmt.bit_depth != current.bit_depth))
+            if player.set_preferred_format(
+                AudioFormat(sample_rate=fmt.sample_rate, bit_depth=fmt.bit_depth, channels=fmt.channels),
+                fmt.codec,
+            ):
+                return route
+        if len(route) == 1 and current.channels == 2:
+            return (route[0], route[0])
+    return route
+
+
+def _endpoint_pcm(ep: EndpointConfig, pcm: bytes) -> bytes:
+    return bytes(len(pcm)) if ep.muted else gain_int16(pcm, ep.gain_db)
+
+
+def _make_feeder(ep: EndpointConfig, sample_rate: int, frames_per_chunk: int, channels: int) -> ChunkFeeder:
     """Build a chunk feeder for one endpoint, pre-filled with its delay as silence."""
-    bytes_per_frame = 2 * len(ep.source_channels)
+    bytes_per_frame = 2 * channels
     feeder = ChunkFeeder(frames_per_chunk * bytes_per_frame)
     delay_frames = int(round(sample_rate * ep.delay_ms / 1000.0))
     if delay_frames > 0:
@@ -56,12 +96,13 @@ def _make_feeder(ep: EndpointConfig, sample_rate: int, frames_per_chunk: int) ->
 
 async def run(config: Config, wav_path: str | None = None, state_dir: str = ".opensurround", *,
               input_pipe: str | None = None, sample_rate: int = 48000,
-              channels: int = 6, sample_format: str = "s32le") -> None:
+              channels: int = 6, sample_format: str = "s32le", web: WebControl | None = None) -> None:
     if bool(wav_path) == bool(input_pipe):
         raise ValueError("provide exactly one WAV or FIFO input")
     source = (PipePCMSource(input_pipe, config.chunk_ms, sample_rate=sample_rate,
                             channels=channels, sample_format=sample_format)
               if input_pipe else WavSource(wav_path, config.chunk_ms))
+    web_stack = AsyncExitStack()
     try:
         _validate_audio(config, source.info.channels)
     except Exception:
@@ -94,10 +135,20 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
         _LOG.info("Sendspin server listening on %s:%s", config.host, config.port)
         _LOG.info("Point Kiosk Satellite Sendspin 'Server' to <this-host>:%s if discovery picks Music Assistant instead.", config.port)
 
+        if web is not None:
+            await web_stack.enter_async_context(web.serve(server, source.info.channels))
         if input_pipe:
-            await _run_live(server, config, source)
+            await _run_live(server, config, source, web=web)
             return
-        clients = await _wait_for_named_clients(server, config)
+        if web is None:
+            clients = await _wait_for_named_clients(server, config)
+        else:
+            while True:
+                config = web.at_boundary(config)
+                clients = _match_live_clients(server, config, report=False)
+                if clients and len(clients) == len(config.endpoints):
+                    break
+                await asyncio.sleep(0.5)
         if config.auto_trust_unpaired:
             for client in clients.values():
                 await server.trust_unpaired(client.client_id, approved_roles={"player"})
@@ -110,20 +161,20 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
 
         channel_ids: dict[str, UUID] = {name: uuid4() for name in clients}
         client_to_channel = {clients[name].client_id: channel_ids[name] for name in clients}
+        routes = {ep.name: _playback_route(ep, clients[ep.name], managed=web is not None)
+                  for ep in config.endpoints}
         stream = group.start_stream(channel_resolver=lambda player_id: client_to_channel[player_id])
-
-        routes = {ep.name: ep.source_channels for ep in config.endpoints}
         fmts = {
             ep.name: AudioFormat(
                 sample_rate=source.info.sample_rate,
                 bit_depth=16,
-                channels=len(ep.source_channels),
+                channels=len(routes[ep.name]),
                 sample_type="int",
             )
             for ep in config.endpoints
         }
         feeders = {
-            ep.name: _make_feeder(ep, source.info.sample_rate, source.frames_per_chunk)
+            ep.name: _make_feeder(ep, source.info.sample_rate, source.frames_per_chunk, len(routes[ep.name]))
             for ep in config.endpoints
         }
         _LOG.info(
@@ -149,7 +200,7 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
             split = split_int16_interleaved(raw, source.info.channels, routes)
             for name, pcm in split.items():
                 ep = next(e for e in config.endpoints if e.name == name)
-                pcm = gain_int16(pcm, ep.gain_db)
+                pcm = _endpoint_pcm(ep, pcm)
                 feeders[name].feed(pcm)
                 chunk = feeders[name].pull()
                 if chunk is not None:
@@ -184,9 +235,17 @@ async def run(config: Config, wav_path: str | None = None, state_dir: str = ".op
         _LOG.info("End of WAV; allowing buffered audio to drain")
         await asyncio.sleep(config.buffer_lead_ms / 1000.0 + 1.0)
         await group.stop()
+        if web is not None:
+            config = web.at_boundary(config)
+            while True:
+                await asyncio.sleep(0.5)
+                config = web.at_boundary(config)
     finally:
         source.close()
-        await server.close()
+        try:
+            await web_stack.aclose()
+        finally:
+            await server.close()
 
 
 def _validate_audio(config: Config, channels: int) -> None:
@@ -194,7 +253,8 @@ def _validate_audio(config: Config, channels: int) -> None:
     if config.chunk_ms <= 0 or config.buffer_lead_ms <= 0:
         raise ValueError("chunk_ms and buffer_lead_ms must be positive")
     for ep in config.endpoints:
-        if not ep.match_name or not ep.source_channels or any(c < 0 or c >= channels for c in ep.source_channels):
+        if (not (ep.client_id or ep.match_name) or not ep.source_channels
+                or any(c < 0 or c >= channels for c in ep.source_channels)):
             raise ValueError(f"endpoint {ep.name}: invalid match name or source channels")
         if not math.isfinite(ep.gain_db) or not math.isfinite(ep.delay_ms) or ep.delay_ms < 0:
             raise ValueError(f"endpoint {ep.name}: gain/delay must be finite and delay nonnegative")
@@ -204,8 +264,7 @@ def _match_live_clients(server: SendspinServer, config: Config, *, report: bool 
     """Ambiguous endpoints and clients matching multiple routes are quarantined."""
     found = {}
     for ep in config.endpoints:
-        matches = [c for c in server.connected_clients
-                   if ep.match_name.casefold() in (c.name or "").casefold()]
+        matches = [c for c in server.connected_clients if _matches_endpoint(ep, c)]
         if len(matches) == 1:
             found[ep.name] = matches[0]
         elif len(matches) > 1 and report:
@@ -217,17 +276,15 @@ def _match_live_clients(server: SendspinServer, config: Config, *, report: bool 
     return {name: c for name, c in found.items() if ids.count(c.client_id) == 1}
 
 
-async def _run_live(server: SendspinServer, config: Config, source: PipePCMSource) -> None:
+async def _run_live(server: SendspinServer, config: Config, source: PipePCMSource,
+                    *, web: WebControl | None = None) -> None:
     loop = asyncio.get_running_loop()
     group = stream = None
     active = {}
     trusted = {}
     feeders = {}
+    input_generation = None
     channel_ids = {ep.name: uuid4() for ep in config.endpoints}
-    formats = {ep.name: AudioFormat(sample_rate=source.info.sample_rate, bit_depth=16,
-                                    channels=len(ep.source_channels), sample_type="int")
-               for ep in config.endpoints}
-    routes = {ep.name: ep.source_channels for ep in config.endpoints}
     previous = None
     # Restart before drift exhausts the lead, not after sending late audio.
     gap_limit = source.interruption_timeout
@@ -262,7 +319,17 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
                 chunk = await asyncio.wait_for(source.read(), timeout=gap_limit)
             except TimeoutError:
                 await stop()
+                if web is not None:
+                    input_generation = None
                 continue
+            if web is not None and input_generation != chunk.generation:
+                updated = web.at_boundary(config)
+                if updated.endpoints != config.endpoints:
+                    await stop()
+                    visible = None
+                    channel_ids = {ep.name: uuid4() for ep in updated.endpoints}
+                config = updated
+                input_generation = chunk.generation
             topology = tuple((c.client_id, c.connection, c.name) for c in server.connected_clients)
             matches = _match_live_clients(server, config, report=topology != visible)
             visible = topology
@@ -304,6 +371,11 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
                 await group.stop()
                 for client in list(matches.values())[1:]:
                     await group.add_client(client)
+                routes = {ep.name: _playback_route(ep, matches[ep.name], managed=web is not None)
+                          for ep in config.endpoints if ep.name in matches}
+                formats = {name: AudioFormat(sample_rate=source.info.sample_rate, bit_depth=16,
+                                             channels=len(route), sample_type="int")
+                           for name, route in routes.items()}
                 mapping = {c.client_id: channel_ids[n] for n, c in matches.items()}
                 stream = group.start_stream(channel_resolver=lambda player_id, m=mapping: m.get(player_id, quarantine_channel))
                 stream.set_live_source(True)
@@ -316,8 +388,9 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
                         req = role.get_audio_requirements()
                         if req is not None and req.transformer is not None:
                             req.transformer.reset()
-                feeders = {ep.name: _make_feeder(ep, source.info.sample_rate, source.frames_per_chunk)
-                           for ep in config.endpoints if ep.name in matches}
+                feeders = {ep.name: _make_feeder(ep, source.info.sample_rate, source.frames_per_chunk,
+                                                len(routes[ep.name]))
+                           for ep in config.endpoints if ep.name in routes}
                 # Trust/group operations may take time. Drain continues; start
                 # with a fresh chunk rather than replaying the triggering one.
                 source.discard()
@@ -329,7 +402,7 @@ async def _run_live(server: SendspinServer, config: Config, source: PipePCMSourc
             split = split_int16_interleaved(chunk.pcm, source.info.channels, routes)
             for ep in config.endpoints:
                 if ep.name in matches:
-                    feeders[ep.name].feed(gain_int16(split[ep.name], ep.gain_db))
+                    feeders[ep.name].feed(_endpoint_pcm(ep, split[ep.name]))
                     pcm = feeders[ep.name].pull()
                     stream.prepare_audio(pcm, formats[ep.name], channel_id=channel_ids[ep.name])
             if anchor is None:

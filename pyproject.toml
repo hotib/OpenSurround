@@ -9,7 +9,9 @@ description = "Open multichannel PCM routing to Sendspin clients on one synchron
 requires-python = ">=3.12"
 dependencies = [
   "aiosendspin[server] @ https://github.com/Sendspin/aiosendspin/archive/611ca195f4ef965c7451cc10b54c150caca12f9c.zip",
+  "aiohttp>=3.10",
   "numpy>=1.26",
+  "tomlkit>=0.13",
 ]
 
 [project.scripts]

@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="hu">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Útvonalak · OpenSurround</title>
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="frame masthead-inner">
+      <div class="brand"><span class="mark" aria-hidden="true"><i></i><i></i><i></i></span> OpenSurround</div>
+      <span id="service" class="service">Csatlakozás…</span>
+    </div>
+  </header>
+  <main class="frame">
+    <p id="error" class="notice error" role="alert" hidden></p>
+    <form id="login" class="panel login" hidden>
+      <h1>Adminisztrátori belépés</h1>
+      <label>Adminisztrátori token
+        <input id="token" type="password" autocomplete="current-password" required>
+      </label>
+      <button type="submit" class="primary">Belépés</button>
+    </form>
+    <div id="dashboard" hidden>
+      <div class="heading">
+        <div>
+          <h1>Hangútvonalak</h1>
+          <p class="subtle">Válaszd ki, melyik bemeneti csatorna melyik Sendspin-eszközön szóljon.</p>
+        </div>
+        <div id="channel-list" class="channel-list" aria-label="Bemeneti csatornák"></div>
+      </div>
+      <div class="layout">
+        <form id="settings" aria-label="Hangútvonalak beállítása">
+          <section aria-labelledby="routes-title">
+            <h2 id="routes-title">Beállított útvonalak</h2>
+            <p id="empty-routes" class="panel empty" hidden>Útvonal hozzáadásához válassz eszközt az eszközlistából.</p>
+            <div id="routes"></div>
+          </section>
+          <div class="actions panel">
+            <p id="save-status" class="subtle" role="status"></p>
+            <div class="buttons">
+              <button id="restore" type="button" class="plain">Előző mentés visszaállítása</button>
+              <button id="discard" type="button">Mentett verzió betöltése</button>
+              <button id="save" type="submit" class="primary">Mentés</button>
+            </div>
+          </div>
+        </form>
+        <aside class="panel inventory" aria-labelledby="devices-title">
+          <h2 id="devices-title">Sendspin-eszközök</h2>
+          <p id="empty-devices" class="subtle" hidden>Az eszközök akkor jelennek meg, amikor csatlakoznak az OpenSurroundhoz.</p>
+          <ul id="devices"></ul>
+        </aside>
+      </div>
+    </div>
+  </main>
+  <template id="route-template">
+    <fieldset class="panel route">
+      <legend><span></span></legend>
+      <div class="route-top">
+        <span class="connection"></span>
+        <button type="button" class="remove plain">Eltávolítás</button>
+      </div>
+      <div class="fields">
+        <label>Útvonal neve<input data-field="label" required></label>
+        <label>Sendspin-eszköz<select data-field="client_id" required></select></label>
+        <label class="legacy" hidden>Névrészlet a párosításhoz<input data-field="match_name"></label>
+        <label>Első forrás<select data-field="first" required></select></label>
+        <label>Második forrás<select data-field="second"></select></label>
+        <label>Erősítés (dB)<input data-field="gain_db" type="number" step="any" required></label>
+        <label>Késleltetés (ms)<input data-field="delay_ms" type="number" step="any" min="0" required></label>
+        <label class="mute"><input data-field="muted" type="checkbox"> Némítás</label>
+      </div>
+    </fieldset>
+  </template>
+</body>
+</html>

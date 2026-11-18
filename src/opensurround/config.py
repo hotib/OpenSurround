@@ -10,6 +10,9 @@ class EndpointConfig:
     source_channels: tuple[int, ...]
     gain_db: float = 0.0
     delay_ms: float = 0.0
+    client_id: str = ""
+    muted: bool = False
+    label: str | None = None
 
 @dataclass(frozen=True)
 class Config:
@@ -23,8 +26,12 @@ class Config:
     endpoints: tuple[EndpointConfig, ...]
 
 
-def load_config(path: str | Path) -> Config:
-    data = tomllib.loads(Path(path).read_text())
+def load_config(path: str | Path, *, allow_empty: bool = False) -> Config:
+    return parse_config(Path(path).read_text(encoding="utf-8"), allow_empty=allow_empty)
+
+
+def parse_config(text: str, *, allow_empty: bool = False) -> Config:
+    data = tomllib.loads(text)
     server = data.get("server", {})
     audio = data.get("audio", {})
     endpoints = []
@@ -34,12 +41,15 @@ def load_config(path: str | Path) -> Config:
             raise ValueError(f"endpoint {name}: source_channels must contain 1 (mono) or 2 (stereo) channels")
         endpoints.append(EndpointConfig(
             name,
-            str(cfg["match_name"]),
+            str(cfg.get("match_name", "")) if cfg.get("client_id") else str(cfg["match_name"]),
             ch,
             gain_db=float(cfg.get("gain_db", 0.0)),
             delay_ms=float(cfg.get("delay_ms", 0.0)),
+            client_id=str(cfg.get("client_id", "")),
+            muted=bool(cfg.get("muted", False)),
+            label=str(cfg["label"]) if "label" in cfg else None,
         ))
-    if len(endpoints) < 1:
+    if not endpoints and not allow_empty:
         raise ValueError("configure at least one endpoint")
     return Config(
         server_name=str(server.get("name", "OpenSurround PoC")),
